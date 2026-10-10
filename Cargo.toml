@@ -1,0 +1,18 @@
+[package]
+name = "rust_android_app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+log = "0.4"
+android_logger = "0.14"
+
+[package.metadata.android]
+package = "com.example.rustandroidapp"
+label = "Rust App"
+min_sdk_version = 26
+target_sdk_version = 34
