@@ -7,12 +7,13 @@ on:
 
 jobs:
   build:
+    name: Build Android APK (ARM64)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Rust
+      - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -37,10 +38,12 @@ jobs:
         env:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
         run: cargo apk build --target aarch64-linux-android
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rust-app-debug
-          path: target/debug/apk/*.apk
+          name: rust-ai-chat-debug-apk
+          path: target/**/apk/*.apk
