@@ -13,7 +13,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Rust Toolchain
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
@@ -24,16 +24,22 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Ensure Android Platform
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-34" "platforms;android-30"
+
       - name: Install cargo-apk
         run: cargo install cargo-apk
 
       - name: Build Debug APK
         env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
           NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: cargo apk build --target aarch64-linux-android
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: rust-ai-chat-debug-apk
-          path: target/**/apk/*.apk
+          name: rust-app-debug
+          path: target/debug/apk/*.apk
