@@ -1,0 +1,9 @@
+[build]
+target = "aarch64-linux-android"
+
+[target.aarch64-linux-android]
+rustflags = [
+    "-C", "target-cpu=cortex-a78",
+    "-C", "target-feature=+v8.2a,+neon,+fp16,+dotprod",
+    "-C", "link-arg=-Wl,-z,max-page-size=16384",
+]

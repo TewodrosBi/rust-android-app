@@ -1,0 +1,15 @@
+{
+  "name": "Rust Android DJ Engine (S24 Ultra)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "latest",
+      "targets": "aarch64-linux-android"
+    }
+  },
+  "containerEnv": {
+    "ANDROID_NDK_HOME": "/home/vscode/android-ndk/android-ndk-r26b"
+  },
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build unzip curl && cargo install cargo-ndk",
+  "remoteUser": "vscode"
+}
