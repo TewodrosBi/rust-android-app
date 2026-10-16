@@ -1,443 +1,483 @@
-use std::sync::mpsc;
-use eframe::egui;
-use egui::{Color32, RichText, Rounding, Stroke};
+pub mod dsp;
+pub mod engine;
+pub mod stems;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ApiProvider {
-    Groq,
-    Gemini,
+use crate::engine::ring_buffer::SharedMixerControls;
+use crate::engine::stream::{DjAudioEngine, DECK_RING_BUFFER_FRAMES};
+use crate::stems::qnn_engine::{HtpPerformanceMode, QnnSessionOptions, TensorPrecision};
+use crate::stems::separator::StemSeparatorHandle;
+use jni::objects::{JClass, JFloatArray, JString};
+use jni::sys::{jboolean, jfloat, jint, jlong, JNI_TRUE};
+use jni::JNIEnv;
+use log::LevelFilter;
+use portable_atomic::Ordering;
+use std::fs;
+use std::sync::{Arc, Mutex, Once};
+
+static LOGGER_INIT: Once = Once::new();
+
+pub struct EngineContext {
+    engine: Mutex<DjAudioEngine>,
+    controls: Arc<SharedMixerControls>,
+    stem_worker: Mutex<Option<StemSeparatorHandle>>,
 }
 
-impl ApiProvider {
-    pub fn name(&self) -> &'static str {
-        match self {
-            ApiProvider::Groq => "Groq (Llama 3.3)",
-            ApiProvider::Gemini => "Google (Gemini 1.5 Flash)",
+fn init_logging() {
+    LOGGER_INIT.call_once(|| {
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(LevelFilter::Info)
+                .with_tag("S24UltraDJAudio"),
+        );
+    });
+}
+
+#[inline(always)]
+unsafe fn with_context<F, R>(engine_ptr: jlong, default: R, f: F) -> R
+where
+    F: FnOnce(&EngineContext) -> R,
+{
+    if engine_ptr == 0 {
+        return default;
+    }
+    let ctx = &*(engine_ptr as *const EngineContext);
+    f(ctx)
+}
+
+/// 1. `nativeInit(sampleRate: Int, burstFrames: Int): Long`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeInit(
+    _env: JNIEnv,
+    _class: JClass,
+    sample_rate: jint,
+    burst_frames: jint,
+) -> jlong {
+    init_logging();
+
+    match DjAudioEngine::new(sample_rate, burst_frames) {
+        Ok(engine) => {
+            let controls = Arc::clone(&engine.controls);
+            let ctx = Box::new(EngineContext {
+                engine: Mutex::new(engine),
+                controls,
+                stem_worker: Mutex::new(None),
+            });
+            Box::into_raw(ctx) as jlong
+        }
+        Err(err) => {
+            log::error!("Failed to initialize DjAudioEngine: {:?}", err);
+            0
         }
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum Role {
-    User,
-    Assistant,
-    Error,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct ChatMessage {
-    pub role: Role,
-    pub content: String,
-}
-
-pub enum WorkerEvent {
-    Response(String),
-    Error(String),
-}
-
-pub struct ChatApp {
-    provider: ApiProvider,
-    groq_api_key: String,
-    gemini_api_key: String,
-    show_api_key: bool,
-    messages: Vec<ChatMessage>,
-    input_text: String,
-    is_generating: bool,
-    error_banner: Option<String>,
-    tx: mpsc::Sender<WorkerEvent>,
-    rx: mpsc::Receiver<WorkerEvent>,
-}
-
-impl ChatApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self {
-            provider: ApiProvider::Groq,
-            groq_api_key: String::new(),
-            gemini_api_key: String::new(),
-            show_api_key: false,
-            messages: vec![ChatMessage {
-                role: Role::Assistant,
-                content: "Hello! I am your mobile Rust AI Chat assistant. Choose your provider above, enter your API key, and ask any question!".to_string(),
-            }],
-            input_text: String::new(),
-            is_generating: false,
-            error_banner: None,
-            tx,
-            rx,
-        }
-    }
-
-    fn send_current_message(&mut self, ctx: &egui::Context) {
-        let user_text = self.input_text.trim().to_string();
-        if user_text.is_empty() || self.is_generating {
-            return;
-        }
-
-        let api_key = match self.provider {
-            ApiProvider::Groq => self.groq_api_key.trim().to_string(),
-            ApiProvider::Gemini => self.gemini_api_key.trim().to_string(),
-        };
-
-        if api_key.is_empty() {
-            self.error_banner = Some(format!(
-                "Please enter an API key for {}",
-                self.provider.name()
-            ));
-            return;
-        }
-
-        self.error_banner = None;
-        self.input_text.clear();
-        self.messages.push(ChatMessage {
-            role: Role::User,
-            content: user_text,
-        });
-
-        self.is_generating = true;
-
-        let provider = self.provider;
-        let history = self.messages.clone();
-        let tx = self.tx.clone();
-        let ctx = ctx.clone();
-
-        std::thread::spawn(move || {
-            let res = call_ai_api(provider, &api_key, &history);
-            match res {
-                Ok(reply) => {
-                    let _ = tx.send(WorkerEvent::Response(reply));
-                }
-                Err(err) => {
-                    let _ = tx.send(WorkerEvent::Error(err));
+/// 2. `nativeStart(enginePtr: Long): Boolean`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeStart(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+) -> jboolean {
+    unsafe {
+        with_context(engine_ptr, 0, |ctx| {
+            if let Ok(mut eng) = ctx.engine.lock() {
+                if eng.start().is_ok() {
+                    return JNI_TRUE;
                 }
             }
-            ctx.request_repaint();
-        });
+            0
+        })
     }
 }
 
-impl eframe::App for ChatApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain any incoming responses from the background worker thread
-        while let Ok(event) = self.rx.try_recv() {
-            self.is_generating = false;
-            match event {
-                WorkerEvent::Response(reply) => {
-                    self.error_banner = None;
-                    self.messages.push(ChatMessage {
-                        role: Role::Assistant,
-                        content: reply,
-                    });
-                }
-                WorkerEvent::Error(err) => {
-                    self.error_banner = Some(err.clone());
-                    self.messages.push(ChatMessage {
-                        role: Role::Error,
-                        content: format!("Error: {}", err),
-                    });
+/// 3. `nativeStop(enginePtr: Long): Boolean`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeStop(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+) -> jboolean {
+    unsafe {
+        with_context(engine_ptr, 0, |ctx| {
+            if let Ok(mut eng) = ctx.engine.lock() {
+                if eng.stop().is_ok() {
+                    return JNI_TRUE;
                 }
             }
-        }
+            0
+        })
+    }
+}
 
-        // Top Panel: API Provider selection and API Key entry
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("🤖 Rust AI Chat");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("🗑 Clear").on_hover_text("Clear conversation history").clicked() {
-                        self.messages.clear();
-                        self.error_banner = None;
+/// 4. `nativeRelease(enginePtr: Long)`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeRelease(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+) {
+    if engine_ptr == 0 {
+        return;
+    }
+    unsafe {
+        let ctx = Box::from_raw(engine_ptr as *mut EngineContext);
+        if let Ok(mut worker_guard) = ctx.stem_worker.lock() {
+            if let Some(mut worker) = worker_guard.take() {
+                worker.shutdown();
+            }
+        }
+        if let Ok(mut eng) = ctx.engine.lock() {
+            let _ = eng.stop();
+        }
+        drop(ctx);
+    }
+}
+
+/// 5. `nativePushDeckAudio(enginePtr: Long, deckIndex: Int, pcmData: FloatArray, offset: Int, length: Int): Int`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativePushDeckAudio(
+    env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    deck_index: jint,
+    pcm_data: JFloatArray,
+    offset: jint,
+    length: jint,
+) -> jint {
+    if engine_ptr == 0 || length <= 0 || offset < 0 {
+        return 0;
+    }
+
+    let copy_len = (length as usize).min(16_384);
+    let mut stack_buf = [0.0_f32; 16_384];
+    if env
+        .get_float_array_region(&pcm_data, offset, &mut stack_buf[..copy_len])
+        .is_err()
+    {
+        return 0;
+    }
+
+    unsafe {
+        with_context(engine_ptr, 0, |ctx| {
+            if let Ok(mut worker_guard) = ctx.stem_worker.lock() {
+                if let Some(ref mut worker) = *worker_guard {
+                    if deck_index == 0 {
+                        let _ = worker
+                            .raw_deck_a_producer
+                            .push_interleaved(&stack_buf[..copy_len]);
+                    } else {
+                        let _ = worker
+                            .raw_deck_b_producer
+                            .push_interleaved(&stack_buf[..copy_len]);
                     }
-                });
-            });
+                }
+            }
 
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Provider:").strong());
-                ui.radio_value(&mut self.provider, ApiProvider::Groq, "Groq (Llama 3.3)");
-                ui.radio_value(
-                    &mut self.provider,
-                    ApiProvider::Gemini,
-                    "Google (Gemini 1.5 Flash)",
-                );
-            });
-
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("API Key:").strong());
-                let key_ref = match self.provider {
-                    ApiProvider::Groq => &mut self.groq_api_key,
-                    ApiProvider::Gemini => &mut self.gemini_api_key,
+            if let Ok(mut eng) = ctx.engine.lock() {
+                let written = if deck_index == 0 {
+                    eng.deck_a_producer.push_interleaved(&stack_buf[..copy_len])
+                } else {
+                    eng.deck_b_producer.push_interleaved(&stack_buf[..copy_len])
                 };
-                let edit = egui::TextEdit::singleline(key_ref)
-                    .password(!self.show_api_key)
-                    .hint_text(match self.provider {
-                        ApiProvider::Groq => "Enter Groq API Key (gsk_...)",
-                        ApiProvider::Gemini => "Enter Gemini API Key (AIza...)",
-                    })
-                    .desired_width(ui.available_width() - 36.0);
-                ui.add(edit);
-
-                let toggle_icon = if self.show_api_key { "🔒" } else { "👁" };
-                if ui
-                    .button(toggle_icon)
-                    .on_hover_text("Toggle show/hide API key")
-                    .clicked()
-                {
-                    self.show_api_key = !self.show_api_key;
-                }
-            });
-
-            if let Some(err) = &self.error_banner {
-                ui.add_space(4.0);
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(80, 20, 20))
-                    .rounding(Rounding::same(4.0))
-                    .inner_margin(egui::Margin::same(6.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!("⚠ {}", err))
-                                .color(Color32::from_rgb(255, 180, 180)),
-                        );
-                    });
+                written as jint
+            } else {
+                0
             }
+        })
+    }
+}
 
-            if self.is_generating {
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new("Generating response...").italics());
-                });
-            }
-
-            ui.add_space(4.0);
-        });
-
-        // Bottom Panel: Input bar and Send button
-        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let text_input = egui::TextEdit::singleline(&mut self.input_text)
-                    .hint_text("Ask anything... (Enter to send)")
-                    .desired_width(ui.available_width() - 85.0);
-
-                let response = ui.add(text_input);
-
-                let can_send = !self.is_generating && !self.input_text.trim().is_empty();
-                let send_btn = ui.add_enabled(
-                    can_send,
-                    egui::Button::new(RichText::new("Send 🚀").strong()),
-                );
-
-                let enter_pressed = response.has_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
-
-                if (send_btn.clicked() || enter_pressed) && can_send {
-                    self.send_current_message(ctx);
-                    response.request_focus();
-                }
-            });
-            ui.add_space(6.0);
-        });
-
-        // Central Panel: Scrollable conversation history
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    for msg in &self.messages {
-                        render_chat_bubble(ui, msg);
-                        ui.add_space(6.0);
-                    }
-                    if self.is_generating {
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                RichText::new("Thinking...")
-                                    .italics()
-                                    .color(Color32::LIGHT_GRAY),
-                            );
-                        });
-                    }
-                });
+/// 6. `nativeSetDeckEq(enginePtr: Long, deckIndex: Int, low: Float, mid: Float, high: Float)`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeSetDeckEq(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    deck_index: jint,
+    low: jfloat,
+    mid: jfloat,
+    high: jfloat,
+) {
+    unsafe {
+        with_context(engine_ptr, (), |ctx| {
+            let deck = if deck_index == 0 {
+                &ctx.controls.deck_a
+            } else {
+                &ctx.controls.deck_b
+            };
+            deck.eq_low_knob.store(low, Ordering::Relaxed);
+            deck.eq_mid_knob.store(mid, Ordering::Relaxed);
+            deck.eq_high_knob.store(high, Ordering::Relaxed);
         });
     }
 }
 
-fn render_chat_bubble(ui: &mut egui::Ui, msg: &ChatMessage) {
-    let (bg_color, stroke_color, role_label, role_color, text_color) = match msg.role {
-        Role::User => (
-            Color32::from_rgb(30, 45, 70),
-            Color32::from_rgb(60, 90, 140),
-            "👤 You",
-            Color32::from_rgb(130, 180, 255),
-            Color32::WHITE,
-        ),
-        Role::Assistant => (
-            Color32::from_rgb(35, 38, 44),
-            Color32::from_rgb(65, 70, 80),
-            "🤖 Assistant",
-            Color32::from_rgb(140, 220, 160),
-            Color32::from_rgb(230, 230, 230),
-        ),
-        Role::Error => (
-            Color32::from_rgb(60, 25, 25),
-            Color32::from_rgb(120, 50, 50),
-            "⚠️ Error",
-            Color32::from_rgb(255, 120, 120),
-            Color32::from_rgb(255, 200, 200),
-        ),
+/// 7. `nativeSetDeckKills(enginePtr: Long, deckIndex: Int, killLow: Boolean, killMid: Boolean, killHigh: Boolean)`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeSetDeckKills(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    deck_index: jint,
+    kill_low: jboolean,
+    kill_mid: jboolean,
+    kill_high: jboolean,
+) {
+    unsafe {
+        with_context(engine_ptr, (), |ctx| {
+            let deck = if deck_index == 0 {
+                &ctx.controls.deck_a
+            } else {
+                &ctx.controls.deck_b
+            };
+            deck.kill_low.store(kill_low == JNI_TRUE, Ordering::Relaxed);
+            deck.kill_mid.store(kill_mid == JNI_TRUE, Ordering::Relaxed);
+            deck.kill_high
+                .store(kill_high == JNI_TRUE, Ordering::Relaxed);
+        });
+    }
+}
+
+/// 8. `nativeSetDeckGains(enginePtr: Long, deckIndex: Int, trimGain: Float, channelFader: Float)`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeSetDeckGains(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    deck_index: jint,
+    trim_gain: jfloat,
+    channel_fader: jfloat,
+) {
+    unsafe {
+        with_context(engine_ptr, (), |ctx| {
+            let deck = if deck_index == 0 {
+                &ctx.controls.deck_a
+            } else {
+                &ctx.controls.deck_b
+            };
+            deck.trim_gain.store(trim_gain, Ordering::Relaxed);
+            deck.channel_fader.store(channel_fader, Ordering::Relaxed);
+        });
+    }
+}
+
+/// 9. `nativeSetCrossfader(enginePtr: Long, position: Float, curveType: Int)`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeSetCrossfader(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    position: jfloat,
+    curve_type: jint,
+) {
+    unsafe {
+        with_context(engine_ptr, (), |ctx| {
+            ctx.controls
+                .crossfader_pos
+                .store(position, Ordering::Relaxed);
+            ctx.controls
+                .crossfader_curve
+                .store(curve_type as u8, Ordering::Relaxed);
+        });
+    }
+}
+
+/// 10. `nativeSetMasterAndCue(enginePtr: Long, masterGain: Float, cueLevelGain: Float, cueMix: Float, splitCue: Boolean)`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeSetMasterAndCue(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    master_gain: jfloat,
+    cue_level_gain: jfloat,
+    cue_mix: jfloat,
+    split_cue: jboolean,
+) {
+    unsafe {
+        with_context(engine_ptr, (), |ctx| {
+            ctx.controls
+                .master_gain
+                .store(master_gain, Ordering::Relaxed);
+            ctx.controls
+                .cue_level_gain
+                .store(cue_level_gain, Ordering::Relaxed);
+            ctx.controls
+                .cue_master_mix
+                .store(cue_mix, Ordering::Relaxed);
+            ctx.controls
+                .split_cue_output
+                .store(split_cue == JNI_TRUE, Ordering::Relaxed);
+        });
+    }
+}
+
+/// 11. `nativeGetFramesProcessed(enginePtr: Long): Long`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeGetFramesProcessed(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+) -> jlong {
+    unsafe {
+        with_context(engine_ptr, 0, |ctx| {
+            ctx.controls
+                .callback_frames_processed
+                .load(Ordering::Relaxed) as jlong
+        })
+    }
+}
+
+/// 12. `nativeInitStemEngine(enginePtr: Long, modelPath: String): Boolean`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeInitStemEngine(
+    mut env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    model_path: JString,
+) -> jboolean {
+    let path_string: Option<String> = if !model_path.is_null() {
+        env.get_string(&model_path).ok().map(Into::into)
+    } else {
+        None
     };
 
-    egui::Frame::none()
-        .fill(bg_color)
-        .stroke(Stroke::new(1.0, stroke_color))
-        .rounding(Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(10.0))
-        .show(ui, |ui| {
-            ui.label(RichText::new(role_label).strong().color(role_color).size(12.0));
-            ui.add_space(2.0);
-            ui.label(RichText::new(&msg.content).color(text_color).size(14.0));
-        });
-}
+    let context_blob = path_string.and_then(|p| fs::read(p).ok());
 
-fn call_ai_api(
-    provider: ApiProvider,
-    api_key: &str,
-    history: &[ChatMessage],
-) -> Result<String, String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    unsafe {
+        with_context(engine_ptr, 0, |ctx| {
+            let mut worker_guard = match ctx.stem_worker.lock() {
+                Ok(g) => g,
+                Err(_) => return 0,
+            };
 
-    match provider {
-        ApiProvider::Groq => {
-            let messages: Vec<serde_json::Value> = history
-                .iter()
-                .filter_map(|m| match m.role {
-                    Role::User => Some(serde_json::json!({
-                        "role": "user",
-                        "content": m.content
-                    })),
-                    Role::Assistant => Some(serde_json::json!({
-                        "role": "assistant",
-                        "content": m.content
-                    })),
-                    Role::Error => None,
-                })
-                .collect();
-
-            let payload = serde_json::json!({
-                "model": "llama-3.3-70b-versatile",
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 2048
-            });
-
-            let resp = client
-                .post("https://api.groq.com/openai/v1/chat/completions")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("Content-Type", "application/json")
-                .json(&payload)
-                .send()
-                .map_err(|e| format!("Network request failed: {}", e))?;
-
-            let status = resp.status();
-            let body_text = resp
-                .text()
-                .map_err(|e| format!("Failed reading response: {}", e))?;
-
-            if !status.is_success() {
-                return Err(format!("Groq API error ({status}): {body_text}"));
+            if worker_guard.is_some() {
+                return JNI_TRUE;
             }
 
-            let parsed: serde_json::Value = serde_json::from_str(&body_text)
-                .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
+            let mut eng = match ctx.engine.lock() {
+                Ok(e) => e,
+                Err(_) => return 0,
+            };
 
-            let content = parsed["choices"][0]["message"]["content"]
-                .as_str()
-                .ok_or_else(|| format!("Unexpected response format: {body_text}"))?;
+            let (stems_a, stems_b) = match (
+                eng.deck_a_stem_producers.take(),
+                eng.deck_b_stem_producers.take(),
+            ) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return 0,
+            };
 
-            Ok(content.to_string())
-        }
-        ApiProvider::Gemini => {
-            let contents: Vec<serde_json::Value> = history
-                .iter()
-                .filter_map(|m| match m.role {
-                    Role::User => Some(serde_json::json!({
-                        "role": "user",
-                        "parts": [{ "text": m.content }]
-                    })),
-                    Role::Assistant => Some(serde_json::json!({
-                        "role": "model",
-                        "parts": [{ "text": m.content }]
-                    })),
-                    Role::Error => None,
-                })
-                .collect();
+            let options = QnnSessionOptions {
+                perf_mode: HtpPerformanceMode::SustainedHighPerformance,
+                precision: TensorPrecision::Fp16,
+                ..QnnSessionOptions::default()
+            };
 
-            let payload = serde_json::json!({
-                "contents": contents
-            });
-
-            let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={}",
-                api_key
+            let worker = StemSeparatorHandle::spawn(
+                stems_a,
+                stems_b,
+                eng.sample_rate as f32,
+                DECK_RING_BUFFER_FRAMES,
+                options,
+                context_blob.as_deref(),
             );
 
-            let resp = client
-                .post(&url)
-                .header("Content-Type", "application/json")
-                .json(&payload)
-                .send()
-                .map_err(|e| format!("Network request failed: {}", e))?;
-
-            let status = resp.status();
-            let body_text = resp
-                .text()
-                .map_err(|e| format!("Failed reading response: {}", e))?;
-
-            if !status.is_success() {
-                return Err(format!("Gemini API error ({status}): {body_text}"));
-            }
-
-            let parsed: serde_json::Value = serde_json::from_str(&body_text)
-                .map_err(|e| format!("Failed to parse response JSON: {}", e))?;
-
-            let content = parsed["candidates"][0]["content"]["parts"][0]["text"]
-                .as_str()
-                .ok_or_else(|| format!("Unexpected response format: {body_text}"))?;
-
-            Ok(content.to_string())
-        }
+            *worker_guard = Some(worker);
+            JNI_TRUE
+        })
     }
 }
 
-// Android native entry point
-#[cfg(target_os = "android")]
+/// 13. `nativeToggleStemSeparation(enginePtr: Long, deckIndex: Int, enabled: Boolean)`
 #[no_mangle]
-fn android_main(app: winit::platform::android::activity::AndroidApp) {
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
-            .with_tag("RustAIChat"),
-    );
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeToggleStemSeparation(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    deck_index: jint,
+    enabled: jboolean,
+) {
+    let is_enabled = enabled == JNI_TRUE;
+    unsafe {
+        with_context(engine_ptr, (), |ctx| {
+            let deck = if deck_index == 0 {
+                &ctx.controls.deck_a
+            } else {
+                &ctx.controls.deck_b
+            };
+            deck.stem_enabled.store(is_enabled, Ordering::Release);
 
-    log::info!("Rust AI Chat has booted successfully!");
+            if let Ok(worker_guard) = ctx.stem_worker.lock() {
+                if let Some(ref worker) = *worker_guard {
+                    let stem_deck = if deck_index == 0 {
+                        &worker.stem_controls.deck_a
+                    } else {
+                        &worker.stem_controls.deck_b
+                    };
+                    stem_deck.enabled.store(is_enabled, Ordering::Release);
+                }
+            }
+        });
+    }
+}
 
-    let native_options = eframe::NativeOptions {
-        android_app: Some(app),
-        ..Default::default()
-    };
+/// 14. `nativeSetStemGains(enginePtr: Long, deckIndex: Int, vocals: Float, drums: Float, bass: Float, other: Float)`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeSetStemGains(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+    deck_index: jint,
+    vocals: jfloat,
+    drums: jfloat,
+    bass: jfloat,
+    other: jfloat,
+) {
+    let v = vocals.clamp(0.0_f32, 2.0_f32);
+    let d = drums.clamp(0.0_f32, 2.0_f32);
+    let b = bass.clamp(0.0_f32, 2.0_f32);
+    let o = other.clamp(0.0_f32, 2.0_f32);
 
-    let _ = eframe::run_native(
-        "Rust AI Chat",
-        native_options,
-        Box::new(|cc| Ok(Box::new(ChatApp::new(cc)))),
-    );
+    unsafe {
+        with_context(engine_ptr, (), |ctx| {
+            let deck = if deck_index == 0 {
+                &ctx.controls.deck_a
+            } else {
+                &ctx.controls.deck_b
+            };
+            deck.stem_vocals.store(v, Ordering::Relaxed);
+            deck.stem_drums.store(d, Ordering::Relaxed);
+            deck.stem_bass.store(b, Ordering::Relaxed);
+            deck.stem_other.store(o, Ordering::Relaxed);
+        });
+    }
+}
+
+/// 15. `nativeGetLastStemInferenceUs(enginePtr: Long): Long`
+#[no_mangle]
+pub extern "system" fn Java_com_s24ultra_dj_audio_NativeAudioEngine_nativeGetLastStemInferenceUs(
+    _env: JNIEnv,
+    _class: JClass,
+    engine_ptr: jlong,
+) -> jlong {
+    unsafe {
+        with_context(engine_ptr, 0, |ctx| {
+            if let Ok(worker_guard) = ctx.stem_worker.lock() {
+                if let Some(ref worker) = *worker_guard {
+                    let us_a = worker
+                        .stem_controls
+                        .deck_a
+                        .last_inference_us
+                        .load(Ordering::Relaxed);
+                    let us_b = worker
+                        .stem_controls
+                        .deck_b
+                        .last_inference_us
+                        .load(Ordering::Relaxed);
+                    return us_a.max(us_b) as jlong;
+                }
+            }
+            0
+        })
+    }
 }
